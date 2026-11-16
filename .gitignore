@@ -1,0 +1,16 @@
+# Built or fetched locally - never commit these.
+/qvif
+/qlink
+/nftb/
+/wgb/
+/ov2.gz
+/initramfs.gz
+/rootfs64.gz
+
+# VPN material: configs contain private keys.
+*.conf
+/vpn/
+/vpn.tar
+*.tar
+*.key
+*.pem

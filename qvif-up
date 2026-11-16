@@ -1,0 +1,27 @@
+#!/bin/sh
+# qvif-up VIF [CLIENT_IP...]
+# Called by qvif when a downstream qube's vif backend appears. Mirrors the
+# essentials of vif-route-qubes: gateway address on the vif, proxy_arp, a host
+# route to each client address, and the (vif . address) pair in the kill
+# switch's allow-set (which also stops a qube spoofing another's address).
+export PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+vif=$1
+shift
+gw=$(cat /run/qvgw 2>/dev/null)
+[ -n "$gw" ] || { echo "qvif-up: no gateway address in /run/qvgw" >&2; exit 1; }
+
+n=0
+while [ ! -e "/sys/class/net/$vif" ]; do
+	n=$((n + 1))
+	[ "$n" -gt 20 ] && { echo "qvif-up: $vif never appeared" >&2; exit 1; }
+	sleep 1
+done
+
+ifconfig "$vif" "$gw" netmask 255.255.255.255 up || exit 1
+echo 1 > "/proc/sys/net/ipv4/conf/$vif/proxy_arp"
+for a in "$@"; do
+	route add -host "$a" dev "$vif"
+	nft add element inet qvpn allowed "{ \"$vif\" . $a }" 2>/dev/null
+done
+echo "qvif-up: $vif gw=$gw clients=$*"
+exit 0

@@ -1,0 +1,5 @@
+::sysinit:/etc/qinit.sh
+::respawn:/usr/local/sbin/qvif -v -u /usr/local/sbin/qvif-up -D /usr/local/sbin/qvif-down
+hvc0::respawn:-/bin/sh
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r

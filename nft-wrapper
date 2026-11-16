@@ -1,0 +1,5 @@
+#!/bin/sh
+# /usr/local/sbin/nft - run the bundled nftables with its own libc/libs, so it
+# does not depend on anything in Tiny Core's userland.
+B=${NFTB:-/opt/nftb}
+exec "$B/ld.so" --inhibit-cache --library-path "$B/lib" "$B/bin/nft" "$@"

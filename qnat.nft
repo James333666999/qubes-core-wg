@@ -1,0 +1,10 @@
+# Stage 2b: plain NAT so downstream qubes can reach the uplink.
+# (The WireGuard kill-switch ruleset replaces this later.)
+table ip qnat
+delete table ip qnat
+table ip qnat {
+	chain post {
+		type nat hook postrouting priority 100; policy accept;
+		oifname "eth0" masquerade
+	}
+}

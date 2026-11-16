@@ -1,0 +1,5 @@
+#!/bin/sh
+# /usr/local/sbin/wg - run the bundled wireguard-tools 'wg' with its own libc,
+# so it does not depend on anything in Tiny Core's userland.
+B=${WGB:-/opt/wgb}
+exec "$B/ld.so" --inhibit-cache --library-path "$B/lib" "$B/bin/wg" "$@"

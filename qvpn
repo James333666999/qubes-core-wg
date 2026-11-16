@@ -1,0 +1,334 @@
+#!/bin/sh
+# qvpn - WireGuard gateway control (fail-closed).
+#
+#   qvpn               same as: qvpn status
+#   qvpn status        current config, handshake age, downstream qubes, kill switch
+#   qvpn list          configs available on the private volume (* = active)
+#   qvpn use NAME      switch to another config, live (kill switch stays up)
+#   qvpn closed        (init) load only the fully closed kill switch
+#   qvpn boot          (init) load configs from the volume and bring up the default
+#   qvpn ruleset [NAME]  print the nft ruleset for a config (for checking)
+#   qvpn parse NAME      print what is read from a config
+#
+# Configs are plain WireGuard/ProtonVPN .conf files, packed into a tar by
+# mkvpn.sh and imported into this qube's private volume (xvdb). The tar is
+# extracted into RAM (/run/vpn) at boot; nothing is written to disk here.
+#
+# Order matters: the kill switch is loaded BEFORE wg0 exists, so there is never
+# a moment where downstream qubes can reach the uplink directly. If anything
+# fails, the kill switch simply stays and downstream qubes have no network.
+export PATH=${QVPN_PATH:-/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin}
+
+VPNROOT=${QVPN_ROOT:-/run/vpn}
+VPNDIR=$VPNROOT/wg
+STATE=${QVPN_STATE:-/run}
+CMDLINE=${QVPN_CMDLINE:-/proc/cmdline}
+SYSNET=${QVPN_SYSNET:-/sys/class/net} # overridable for testing
+RESOLV=${QVPN_RESOLV:-/etc/resolv.conf}
+WG_IF=wg0
+UPLINK=eth0
+TABLE=qvpn
+VDNS1=10.139.1.1
+VDNS2=10.139.1.2
+
+log() { echo "qvpn: $*"; }
+
+valid_name() {
+	case $1 in
+	'' | *[!a-z0-9_-]*) return 1 ;;
+	esac
+	return 0
+}
+
+conf_get() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | head -n 1 | tr -d '\r '; }
+
+isv4() {
+	case $1 in
+	'' | *[!0-9.]*) return 1 ;;
+	esac
+	[ "$(echo "$1" | tr -cd . | wc -c)" -eq 3 ]
+}
+
+parse_conf() {
+	ADDR= DNS_VPN= MTU= EP= EP_IP= EP_PORT=
+	[ -f "$CONF" ] || { log "no such config: $CONF"; return 1; }
+	grep -q '^[[:space:]]*PrivateKey' "$CONF" || { log "$CONF has no PrivateKey"; return 1; }
+	ADDR=$(conf_get Address | tr ',' '\n' | grep -v ':' | head -n 1)
+	DNS_VPN=$(conf_get DNS | tr ',' '\n' | grep -v ':' | head -n 1)
+	MTU=$(conf_get MTU)
+	EP=$(conf_get Endpoint)
+	EP_IP=${EP%:*}
+	EP_PORT=${EP##*:}
+	[ -n "$ADDR" ] || { log "no IPv4 Address in $CONF"; return 1; }
+	[ -n "$DNS_VPN" ] || { log "no IPv4 DNS in $CONF"; return 1; }
+	isv4 "$EP_IP" || { log "Endpoint must be an IPv4 address, not '$EP' (mkvpn.sh resolves names for you)"; return 1; }
+	case $EP_PORT in '' | *[!0-9]*) log "bad Endpoint port in '$EP'"; return 1 ;; esac
+	return 0
+}
+
+# Uses ADDR/DNS_VPN/EP_*; with them empty it is the fully closed ruleset.
+ruleset() {
+	EP_RULE="# (no endpoint: nothing may leave the uplink)"
+	[ -n "$EP_IP" ] && EP_RULE="oifname \"$UPLINK\" ip daddr $EP_IP udp dport $EP_PORT accept"
+	DNS_RULE1="# (no VPN DNS known)"
+	DNS_RULE2=
+	if [ -n "$DNS_VPN" ]; then
+		DNS_RULE1="iifname \"vif*\" ip daddr { $VDNS1, $VDNS2 } udp dport 53 dnat ip to $DNS_VPN"
+		DNS_RULE2="iifname \"vif*\" ip daddr { $VDNS1, $VDNS2 } tcp dport 53 dnat ip to $DNS_VPN"
+	fi
+	cat <<EOF
+table inet $TABLE
+delete table inet $TABLE
+table inet $TABLE {
+	# (downstream vif . client address) pairs, maintained by qvif-up/qvif-down.
+	# Doubles as anti-spoofing: a qube can only send from its own address.
+	set allowed {
+		type ifname . ipv4_addr
+	}
+	chain input {
+		type filter hook input priority -10; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		iifname "vif*" icmp type echo-request accept
+	}
+	chain output {
+		type filter hook output priority -10; policy drop;
+		oifname "lo" accept
+		oifname "$WG_IF" accept
+		oifname "vif*" accept
+		$EP_RULE
+	}
+	chain forward {
+		type filter hook forward priority -10; policy drop;
+		meta iifname . ip saddr @allowed oifname "$WG_IF" accept
+		iifname "$WG_IF" oifname "vif*" ct state established,related accept
+	}
+	chain mss {
+		type filter hook forward priority -150; policy accept;
+		oifname "$WG_IF" tcp flags syn tcp option maxseg size set rt mtu
+	}
+	chain dns {
+		type nat hook prerouting priority -100; policy accept;
+		$DNS_RULE1
+		$DNS_RULE2
+	}
+	chain post {
+		type nat hook postrouting priority 100; policy accept;
+		oifname "$WG_IF" masquerade
+	}
+}
+EOF
+}
+
+# nft reads the ruleset from a file: 'nft -f -' needs /dev/stdin, which this
+# minimal userland does not have. (The ruleset holds no secrets.)
+load_ruleset() {
+	ruleset > "$STATE/qvpn.nft" && nft -f "$STATE/qvpn.nft"
+}
+
+# Reloading the table empties the 'allowed' set; refill it from the host routes
+# qvif-up added (one per downstream qube).
+resync_allowed() {
+	route -n 2>/dev/null | awk '$8 ~ /^vif/ && $4 ~ /H/ {print $8, $1}' | while read -r v a; do
+		nft add element inet "$TABLE" allowed "{ \"$v\" . $a }" 2>/dev/null
+	done
+}
+
+load_configs() {
+	dev=${QVPN_DEV:-/dev/xvdb}
+	mkdir -p "$VPNROOT"
+	chmod 700 "$VPNROOT"
+	if [ ! -e "$dev" ]; then
+		log "no $dev: no VPN configs"
+		return 1
+	fi
+	err=$(tar xf "$dev" -C "$VPNROOT" 2>&1 | head -n 2)
+	chmod -R go-rwx "$VPNROOT" 2>/dev/null
+	[ -n "$(names)" ] && return 0
+	sz=$(cat "/sys/class/block/${dev##*/}/size" 2>/dev/null)
+	log "no configs read from $dev (${sz:-?} sectors). tar said: ${err:-nothing}"
+	return 1
+}
+
+# list/status/use work even if 'boot' has not run (or failed) yet.
+ensure_configs() {
+	[ -n "$(names)" ] || load_configs
+}
+
+names() {
+	for f in "$VPNDIR"/*.conf; do
+		[ -f "$f" ] || continue
+		n=${f##*/}
+		echo "${n%.conf}"
+	done
+}
+
+# Exact config name, else a part of a name if it matches exactly one config
+# (typing is awkward on this console: 'qvpn use 11' is enough for wg-ch-11).
+resolve_name() {
+	case $1 in '' | *[!a-z0-9_-]*) return 1 ;; esac
+	if [ -f "$VPNDIR/$1.conf" ]; then echo "$1"; return 0; fi
+	m=$(names | grep -F -- "$1")
+	if [ -n "$m" ] && [ "$(echo "$m" | wc -l)" -eq 1 ]; then echo "$m"; return 0; fi
+	return 1
+}
+
+default_name() {
+	n=
+	for a in $(cat "$CMDLINE" 2>/dev/null); do
+		case $a in qwg=*) n=${a#qwg=} ;; esac
+	done
+	if [ -n "$n" ]; then
+		if m=$(resolve_name "$n"); then
+			n=$m
+		else
+			log "qwg=$n matches no single config - using the default instead" >&2
+			n=
+		fi
+	fi
+	[ -n "$n" ] || n=$(tr -d ' \r\n' < "$VPNDIR/default" 2>/dev/null)
+	[ -n "$n" ] || n=$(names | head -n 1)
+	echo "$n"
+}
+
+wait_handshake() {
+	i=0
+	HS=0
+	while [ "$i" -lt 15 ]; do
+		ping -c 1 -W 2 "$DNS_VPN" >/dev/null 2>&1 # any packet triggers the handshake
+		HS=$(wg show "$WG_IF" latest-handshakes | awk '{print $2; exit}')
+		[ "${HS:-0}" -gt 0 ] && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+# Bring the tunnel up with config NAME, from nothing or from another config.
+activate() {
+	NAME=$1
+	valid_name "$NAME" || { log "bad config name '$NAME' (use a-z 0-9 _ -)"; return 1; }
+	CONF=$VPNDIR/$NAME.conf
+	[ -f "$CONF" ] || { log "no config named '$NAME'. Available: $(names | tr '\n' ' ')"; return 1; }
+	parse_conf || return 1 # a bad config leaves the running tunnel untouched
+
+	load_ruleset || { log "FAILED to load the ruleset; nothing changed"; return 1; }
+	resync_allowed
+	log "kill switch loaded for $NAME (endpoint $EP_IP:$EP_PORT)"
+
+	if [ ! -d "$SYSNET/$WG_IF" ]; then
+		modprobe wireguard 2>/dev/null
+		qlink add "$WG_IF" wireguard "${MTU:-1420}" || { log "could not create $WG_IF (wireguard module?). Staying closed."; return 1; }
+	fi
+
+	# wg setconf rejects wg-quick keys, so strip them. Keys never touch disk.
+	# (a mode-600 copy in RAM for a moment: wg wants a file, and /dev/stdin is missing here)
+	WGTMP=$STATE/qvpn.wg
+	(umask 077; sed -r '/^[[:space:]]*(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown|SaveConfig)[[:space:]]*=/d' "$CONF" > "$WGTMP")
+	wg setconf "$WG_IF" "$WGTMP"
+	rc=$?
+	rm -f "$WGTMP"
+	[ "$rc" -eq 0 ] || { log "wg setconf failed. Staying closed."; return 1; }
+	PEER=$(wg show "$WG_IF" peers | head -n 1)
+	[ -n "$PEER" ] && wg set "$WG_IF" peer "$PEER" persistent-keepalive 25
+
+	ifconfig "$WG_IF" "${ADDR%/*}" netmask 255.255.255.255 mtu "${MTU:-1420}" up || { log "could not configure $WG_IF"; return 1; }
+
+	# The endpoint keeps going out of the uplink; everything else goes into the
+	# tunnel via two /1 routes (the WireGuard "default route override" trick).
+	OLDEP=$(cat "$STATE/qvpn.ep" 2>/dev/null)
+	[ -n "$OLDEP" ] && [ "$OLDEP" != "$EP_IP" ] && route del -host "$OLDEP" 2>/dev/null
+	QGW=$(cat "$STATE/qgw" 2>/dev/null)
+	[ -n "$QGW" ] && route add -host "$EP_IP" gw "$QGW" dev "$UPLINK" 2>/dev/null
+	route add -net 0.0.0.0 netmask 128.0.0.0 dev "$WG_IF" 2>/dev/null
+	route add -net 128.0.0.0 netmask 128.0.0.0 dev "$WG_IF" 2>/dev/null
+	echo "nameserver $DNS_VPN" > "$RESOLV"
+	echo "$EP_IP" > "$STATE/qvpn.ep"
+	echo "$NAME" > "$STATE/qvpn.cur"
+
+	if wait_handshake; then
+		log "tunnel up: $NAME ($WG_IF ${ADDR%/*} -> $EP_IP:$EP_PORT), handshake ok"
+		return 0
+	fi
+	log "NO HANDSHAKE yet for $NAME with $EP_IP:$EP_PORT. Kill switch stays on (WireGuard retries whenever traffic is sent); downstream qubes have no network until it succeeds."
+	log "check: is the endpoint reachable, does dom0 firewall for this qube allow it, is the config current?"
+	return 1
+}
+
+closed_load() {
+	ADDR= DNS_VPN= EP_IP= EP_PORT=
+	load_ruleset
+}
+
+status() {
+	ensure_configs
+	cur=$(cat "$STATE/qvpn.cur" 2>/dev/null)
+	echo "config : ${cur:-none}   available: $(names | tr '\n' ' ')"
+	if [ -d "$SYSNET/$WG_IF" ]; then
+		ts=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+		if [ "${ts:-0}" -gt 0 ]; then
+			echo "tunnel : handshake $(($(date +%s) - ts))s ago"
+		else
+			echo "tunnel : NO HANDSHAKE (traffic is blocked, not leaked)"
+		fi
+		wg show "$WG_IF" transfer 2>/dev/null | awk '{print "xfer   : rx " $2 " tx " $3 " bytes"}'
+	else
+		echo "tunnel : $WG_IF not created"
+	fi
+	echo "vifs   : $(route -n 2>/dev/null | awk '$8 ~ /^vif/ && $4 ~ /H/ {printf "%s=%s ", $8, $1}')"
+	if nft list table inet "$TABLE" >/dev/null 2>&1; then
+		echo "killsw : loaded"
+	else
+		echo "killsw : MISSING"
+	fi
+}
+
+cmd=${1:-status}
+case $cmd in
+status) status ;;
+list)
+	ensure_configs
+	cur=$(cat "$STATE/qvpn.cur" 2>/dev/null)
+	for n in $(names); do
+		if [ "$n" = "$cur" ]; then echo "* $n"; else echo "  $n"; fi
+	done
+	;;
+use)
+	[ -n "$2" ] || { echo "usage: qvpn use NAME   (see: qvpn list)"; exit 2; }
+	ensure_configs
+	n=$(resolve_name "$2") || { log "no single config matches '$2'. Available: $(names | tr '\n' ' ')"; exit 1; }
+	[ "$n" = "$2" ] || log "'$2' -> $n"
+	activate "$n"
+	;;
+ruleset)
+	CONF=$VPNDIR/${2:-$(default_name)}.conf
+	parse_conf >/dev/null 2>&1
+	ruleset
+	;;
+parse)
+	CONF=$VPNDIR/$2.conf
+	parse_conf || exit 1
+	echo "address=$ADDR dns=$DNS_VPN mtu=${MTU:-default} endpoint=$EP_IP port=$EP_PORT"
+	;;
+closed)
+	for f in all default; do
+		[ -w "/proc/sys/net/ipv6/conf/$f/disable_ipv6" ] && echo 1 > "/proc/sys/net/ipv6/conf/$f/disable_ipv6"
+	done
+	closed_load || { log "FAILED to load the kill switch"; exit 1; }
+	log "kill switch loaded (nothing forwarded until a tunnel is up)"
+	;;
+boot)
+	# fully closed first, whatever happens next
+	nft list table inet "$TABLE" >/dev/null 2>&1 || {
+		closed_load || { log "FAILED to load the kill switch - NOT bringing any tunnel up"; exit 1; }
+	}
+	load_configs || { log "no VPN configs found (import them with mkvpn.sh). Staying closed."; exit 1; }
+	n=$(default_name)
+	log "configs: $(names | tr '\n' ' ') - using '$n'"
+	activate "$n"
+	;;
+*)
+	echo "usage: qvpn [status|list|use NAME|closed|boot|ruleset [NAME]|parse NAME]"
+	exit 2
+	;;
+esac

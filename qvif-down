@@ -1,0 +1,13 @@
+#!/bin/sh
+# qvif-down VIF [CLIENT_IP...] - undo qvif-up (errors ignored; the vif is
+# usually already gone when the backend node disappears).
+export PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+vif=$1
+shift
+for a in "$@"; do
+	nft delete element inet qvpn allowed "{ \"$vif\" . $a }" 2>/dev/null
+	route del -host "$a" dev "$vif" 2>/dev/null
+done
+ifconfig "$vif" down 2>/dev/null
+echo "qvif-down: $vif"
+exit 0
