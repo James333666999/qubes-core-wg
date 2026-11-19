@@ -1,7 +1,7 @@
 # Qubes Core WG
 
-> **Alpha, version 0.1.0-alpha.** Works on the author's setup, has had little testing
-> beyond it, and may change without notice. See [Status](#status).
+> **Alpha, version 0.1.0-alpha.** Works for me, has had little some testing.
+>  may change without notice. See [Status](#status).
 
 A WireGuard VPN gateway qube for Qubes OS that fits in a ~9 MB initramfs: Tiny
 Core Linux's userland, booted on the kernel dom0 provides, with a fail-closed
@@ -177,6 +177,7 @@ MIT, see [LICENSE](LICENSE). The bundled `nft` and `wg` you fetch yourself are u
 own licenses (GPL).
 
 ## Credits
+@palainp and @unman for design ideas, input from claude, julius,  tinycore and xen, wikis etc....
 
 Built on Tiny Core Linux, BusyBox, nftables, wireguard-tools and the Qubes OS
 network model. The starting point was unman's Tiny Core Qubes template
